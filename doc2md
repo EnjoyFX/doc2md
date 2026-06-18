@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""
+doc2md — convert DOCX/XLSX/PPTX to Markdown via markitdown,
+extracting embedded images into a configurable folder
+with names: <docname>_NN.<ext>, and inlining links to them in the MD.
+
+Usage:
+  doc2md <file> [-i IMAGES_DIR] [-o OUTPUT_DIR]
+
+Options:
+  -i, --images-dir DIR   Directory for extracted images (default: images)
+  -o, --output-dir DIR   Directory for the .md file     (default: current dir)
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+SUPPORTED_EXT = {".docx", ".xlsx", ".pptx"}
+MEDIA_PATH = {".docx": "word/media", ".xlsx": "xl/media", ".pptx": "ppt/media"}
+MIME_EXT = {
+    "jpeg": "jpg",
+    "svg+xml": "svg",
+    "x-emf": "emf",
+    "x-wmf": "wmf",
+    "tiff": "tif",
+}
+
+DATA_URI_RE = re.compile(
+    r"data:image/([a-zA-Z0-9+.\-]+);base64,([A-Za-z0-9+/=\s]+?)(?=[)\s\"'<])",
+    re.DOTALL,
+)
+
+
+def ext_from_mime(mime: str) -> str:
+    mime = mime.lower()
+    return MIME_EXT.get(mime, mime)
+
+
+def run_markitdown(src: Path, keep_data_uris: bool) -> str:
+    cmd = ["markitdown", str(src)]
+    if keep_data_uris:
+        cmd.append("--keep-data-uris")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr)
+        sys.exit(result.returncode)
+    # filter the noisy pydub SyntaxWarnings
+    for line in result.stderr.splitlines():
+        if "SyntaxWarning" not in line and 're.match' not in line:
+            sys.stderr.write(line + "\n")
+    return result.stdout
+
+
+def replace_data_uris(md: str, base: str, img_dir: Path, md_dir: Path) -> tuple[str, int]:
+    """Replace inline base64 image data URIs with on-disk files. Returns (new_md, count)."""
+    img_dir.mkdir(parents=True, exist_ok=True)
+    counter = 0
+
+    def _sub(match: re.Match) -> str:
+        nonlocal counter
+        counter += 1
+        mime = match.group(1)
+        b64 = re.sub(r"\s+", "", match.group(2))
+        try:
+            data = base64.b64decode(b64, validate=False)
+        except Exception:
+            return match.group(0)  # leave untouched on decode failure
+        ext = ext_from_mime(mime)
+        name = f"{base}_{counter:02d}.{ext}"
+        (img_dir / name).write_bytes(data)
+        rel = os.path.relpath(img_dir / name, md_dir)
+        return rel
+
+    new_md = DATA_URI_RE.sub(_sub, md)
+    return new_md, counter
+
+
+def fallback_unzip(src: Path, base: str, img_dir: Path) -> int:
+    """Fallback: extract media files directly from the Office ZIP. No MD links inserted."""
+    media_prefix = MEDIA_PATH[src.suffix.lower()]
+    img_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    with zipfile.ZipFile(src) as zf:
+        members = sorted(
+            (m for m in zf.namelist() if m.startswith(media_prefix + "/")),
+            key=lambda s: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s)],
+        )
+        for i, member in enumerate(members, 1):
+            ext = Path(member).suffix.lstrip(".") or "bin"
+            name = f"{base}_{i:02d}.{ext}"
+            with zf.open(member) as src_f, open(img_dir / name, "wb") as out:
+                shutil.copyfileobj(src_f, out)
+            count += 1
+    return count
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="doc2md",
+        description="Convert DOCX/XLSX/PPTX to Markdown with extracted images.",
+    )
+    p.add_argument("input", help="path to .docx/.xlsx/.pptx file")
+    p.add_argument("-i", "--images-dir", default="images",
+                   help="directory for extracted images. Relative paths are "
+                        "resolved against --output-dir; pass an absolute path "
+                        "to override. (default: images)")
+    p.add_argument("-o", "--output-dir", default=".",
+                   help="directory for the .md file (default: current dir)")
+    args = p.parse_args()
+
+    src = Path(args.input)
+    if not src.is_file():
+        sys.exit(f"File not found: {src}")
+    if src.suffix.lower() not in SUPPORTED_EXT:
+        sys.exit(f"Unsupported extension: {src.suffix} (need .docx/.xlsx/.pptx)")
+
+    base = src.stem
+    out_dir = Path(args.output_dir)
+    img_arg = Path(args.images_dir)
+    img_dir = img_arg if img_arg.is_absolute() else out_dir / img_arg
+    out_dir.mkdir(parents=True, exist_ok=True)
+    md_path = out_dir / f"{base}.md"
+
+    md = run_markitdown(src, keep_data_uris=True)
+    md_new, linked = replace_data_uris(md, base, img_dir, out_dir)
+
+    extracted = linked
+    if linked == 0:
+        # markitdown emitted no data URIs (typical for XLSX, often for PPTX) —
+        # fall back to pulling media straight from the Office ZIP.
+        extracted = fallback_unzip(src, base, img_dir)
+
+    md_path.write_text(md_new, encoding="utf-8")
+
+    print(f"Markdown: {md_path}")
+    if linked > 0:
+        print(f"Images:   {linked} extracted to {img_dir}/ (linked inline in MD)")
+    elif extracted > 0:
+        print(f"Images:   {extracted} extracted to {img_dir}/ (not linked — "
+              f"markitdown did not emit references for this format)")
+    else:
+        print(f"Images:   0 (none found in document)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
