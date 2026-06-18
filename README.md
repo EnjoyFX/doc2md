@@ -5,15 +5,19 @@ that converts Office documents (`.docx`, `.xlsx`, `.pptx`) to Markdown **and**
 extracts the embedded images into a folder of your choice, with predictable,
 sequentially numbered filenames.
 
-Unlike vanilla `markitdown`, which by default strips images entirely (or, with
-`--keep-data-uris`, inlines them as base64 blobs that make the Markdown file
-unreadable), `doc2md`:
+Vanilla `markitdown` keeps image positions in the output but, by default,
+truncates each base64 payload to `data:image/png;base64...` — the placeholder
+shows where an image was, but the link does not actually resolve. With
+`--keep-data-uris` it preserves the full base64, which makes every image
+viewable but bloats the Markdown into something humans cannot read or diff.
+
+`doc2md` keeps the position **and** the image content, without the bloat:
 
 - writes every image as a real file on disk (`<doc>_01.png`, `<doc>_02.jpg`, ...),
-- rewrites the Markdown so each `![](...)` link points at the on-disk file with a
-  relative path that stays correct regardless of where you put the output,
+- rewrites the Markdown so each `![](...)` link points at the on-disk file with
+  a relative path that stays correct regardless of where you put the output,
 - falls back to extracting images straight from the Office ZIP when MarkItDown
-  does not emit references for a given format (typical for `.xlsx`).
+  does not emit any image references for a given format (typical for `.xlsx`).
 
 ## Requirements
 
@@ -124,11 +128,15 @@ Images go to `/tmp/shared-img/`; Markdown links use an absolute path.
 
 ## Behaviour by format
 
-| Format | What MarkItDown emits | What `doc2md` does |
+| Format | What MarkItDown emits (with `--keep-data-uris`) | What `doc2md` does |
 | --- | --- | --- |
-| `.docx` | Inline base64 data URIs (via `mammoth`). | Extracts every image to a file, **rewrites the Markdown links** to point at the file. |
-| `.pptx` | Usually no inline image references. | Falls back to ZIP extraction; images are saved to disk but **not linked** in the Markdown. The script tells you when this happens. |
+| `.docx` | Full inline base64 data URIs (via `mammoth`). | Extracts every image to a file, **rewrites the Markdown links** to point at the file. |
+| `.pptx` | Usually no inline image references at all. | Falls back to ZIP extraction; images are saved to disk but **not linked** in the Markdown. The script tells you when this happens. |
 | `.xlsx` | No inline image references. | Same as `.pptx`: ZIP extraction, no inline links. |
+
+Note: without `--keep-data-uris`, MarkItDown truncates the base64 in every
+`![](...)` link, so the references are present but unusable. `doc2md` always
+runs MarkItDown with that flag and then replaces the URIs with file paths.
 
 The fallback exists because workbook and slide-deck images are not part of the
 linear text flow that Markdown represents, so there is no unambiguous insertion
